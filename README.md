@@ -12,6 +12,8 @@ So, for a deep dive into how the code and shaders are structured (SSBOs, ping-po
 
 ## Demo video
 
+[![JuicyFlock demo video thumbnail](https://i.ytimg.com/vi/jg4g5PGKCzM/maxresdefault.jpg)](https://www.youtube.com/watch?v=jg4g5PGKCzM)
+
 - Watch on YouTube: [`https://www.youtube.com/watch?v=jg4g5PGKCzM`](https://www.youtube.com/watch?v=jg4g5PGKCzM)
 - Local file (stored via Git LFS): [`docs/JuicyFlockRecording.mp4`](docs/JuicyFlockRecording.mp4)
 
