@@ -1,0 +1,305 @@
+#version 430 core
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct Particle
+{
+    vec4 pos;
+    vec4 vel;
+    vec4 color;
+};
+
+layout (std430, binding = 0) readonly buffer ParticlesIn
+{
+    Particle pin[];
+};
+
+layout (std430, binding = 1) buffer ParticlesOut
+{
+    Particle pout[];
+};
+
+layout (std430, binding = 2) readonly buffer CellHeads
+{
+    int head[];
+};
+
+layout (std430, binding = 3) readonly buffer NextIndex
+{
+    int next[];
+};
+
+uniform int   u_particleCount;
+uniform ivec3 u_gridDims;
+uniform vec3  u_worldMin;
+uniform vec3  u_worldMax;
+uniform float u_cellSize;
+uniform float u_dt;
+
+uniform float u_neighborRadius;
+uniform float u_separationRadius;
+uniform float u_weightSeparation;
+uniform float u_weightAlignment;
+uniform float u_weightCohesion;
+uniform float u_minSpeed;
+uniform float u_maxSpeed;
+uniform float u_maxAccel;
+uniform float u_centerAttraction;
+uniform float u_boundaryMargin;
+uniform float u_boundaryStrength;
+uniform int   u_wrapBounds;
+
+// Coloring
+uniform int   u_colorMode;     // 0 solid, 1 heading, 2 speed, 3 density
+uniform float u_hueOffset;     // 0..1
+uniform float u_hueRange;      // 0..1
+uniform float u_saturation;    // 0..1
+uniform float u_value;         // 0..1
+uniform float u_densityCurve;  // >0
+
+int flattenCell (ivec3 c)
+{
+    return c.x + u_gridDims.x * (c.y + u_gridDims.y * c.z);
+}
+
+vec3 hsv2rgb (vec3 c)
+{
+    vec4 K = vec4 (1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs (fract (c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix (K.xxx, clamp (p - K.xxx, 0.0, 1.0), c.y);
+}
+
+// Deterministic per-particle pseudo-random in [0,1). Used to avoid directional bias when vel collapses to ~0.
+uint hashU32 (uint x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+float hash01 (uint x)
+{
+    return float (hashU32 (x)) * (1.0 / 4294967296.0); // 2^32
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint (u_particleCount))
+        return;
+
+    vec3 pos = pin[int (i)].pos.xyz;
+    vec3 vel = pin[int (i)].vel.xyz;
+
+    ivec3 cell = ivec3 (floor ((pos - u_worldMin) / u_cellSize));
+    cell = clamp (cell, ivec3 (0), u_gridDims - ivec3 (1));
+
+    vec3 separation = vec3 (0.0);
+    vec3 alignment  = vec3 (0.0);
+    vec3 cohesion   = vec3 (0.0);
+    int neighbourCount = 0;
+    int separationCount = 0;
+
+    // Hard cap to avoid pathological slowdown when lots of particles occupy the same cell(s)
+    const int kMaxNeighbours = 128;
+
+    float rN = max (u_neighborRadius, 1.0e-3);
+    float rS = max (u_separationRadius, 1.0e-3);
+    float rN2 = rN * rN;
+    float rS2 = rS * rS;
+
+    for (int dz = -1; dz <= 1; ++dz)
+    {
+        for (int dy = -1; dy <= 1; ++dy)
+        {
+            for (int dx = -1; dx <= 1; ++dx)
+            {
+                ivec3 nc = cell + ivec3 (dx, dy, dz);
+                if (any (lessThan (nc, ivec3 (0))) || any (greaterThanEqual (nc, u_gridDims)))
+                    continue;
+
+                int ci = flattenCell (nc);
+                for (int j = head[ci]; j != -1; j = next[j])
+                {
+                    if (j == int (i))
+                        continue;
+
+                    vec3 d = pin[j].pos.xyz - pos;
+                    float dist2 = dot (d, d);
+
+                    if (dist2 < 1.0e-10 || dist2 > rN2)
+                        continue;
+
+                    cohesion += pin[j].pos.xyz;
+                    alignment += pin[j].vel.xyz;
+                    neighbourCount++;
+
+                    if (neighbourCount >= kMaxNeighbours)
+                        break;
+
+                    if (dist2 < rS2)
+                    {
+                        // push away (inverse square-ish)
+                        separation -= d / (dist2 + 1.0e-4);
+                        separationCount++;
+                    }
+                }
+
+                if (neighbourCount >= kMaxNeighbours)
+                    break;
+            }
+
+            if (neighbourCount >= kMaxNeighbours)
+                break;
+        }
+
+        if (neighbourCount >= kMaxNeighbours)
+            break;
+    }
+
+    vec3 steerCoh = vec3 (0.0);
+    vec3 steerAli = vec3 (0.0);
+    vec3 steerSep = vec3 (0.0);
+
+    if (neighbourCount > 0)
+    {
+        vec3 avgPos = cohesion / float (neighbourCount);
+        vec3 avgVel = alignment / float (neighbourCount);
+
+        steerCoh = (avgPos - pos);
+        steerAli = (avgVel - vel);
+    }
+
+    if (separationCount > 0)
+        steerSep = separation / float (separationCount);
+
+    vec3 accel = (u_weightSeparation * steerSep)
+               + (u_weightAlignment  * steerAli)
+               + (u_weightCohesion   * steerCoh);
+
+    // Mild global cohesion towards the center of the domain (helps prevent uniform diffusion)
+    vec3 center = 0.5 * (u_worldMin + u_worldMax);
+    accel += (center - pos) * u_centerAttraction;
+
+    // Soft boundary steering (more bird-like than wrap), unless wrap is explicitly enabled
+    if (u_wrapBounds == 0)
+    {
+        float m = max (u_boundaryMargin, 1.0e-3);
+        float k = u_boundaryStrength;
+
+        float xmin = u_worldMin.x + m;
+        float xmax = u_worldMax.x - m;
+        float ymin = u_worldMin.y + m;
+        float ymax = u_worldMax.y - m;
+        float zmin = u_worldMin.z + m;
+        float zmax = u_worldMax.z - m;
+
+        if (pos.x < xmin) accel.x += k * (xmin - pos.x) / m;
+        if (pos.x > xmax) accel.x -= k * (pos.x - xmax) / m;
+        if (pos.y < ymin) accel.y += k * (ymin - pos.y) / m;
+        if (pos.y > ymax) accel.y -= k * (pos.y - ymax) / m;
+        if (pos.z < zmin) accel.z += k * (zmin - pos.z) / m;
+        if (pos.z > zmax) accel.z -= k * (pos.z - zmax) / m;
+    }
+
+    // Limit steering force (prevents jitter + helps produce coherent flow)
+    float aLen = length (accel);
+    if (u_maxAccel > 0.0 && aLen > u_maxAccel)
+        accel = accel / max (aLen, 1.0e-6) * u_maxAccel;
+
+    vel += accel * u_dt;
+
+    // Clamp speed
+    float speed = length (vel);
+    if (speed < 1.0e-5)
+    {
+        // Previously this used a fixed +X direction, which injects net momentum and can cause corner "pile-ups"
+        // when u_centerAttraction is 0 and wrap is disabled.
+        float h1 = hash01 (i * 3u + 0u) * 2.0 - 1.0;
+        float h2 = hash01 (i * 3u + 1u) * 2.0 - 1.0;
+        float h3 = hash01 (i * 3u + 2u) * 2.0 - 1.0;
+        vec3 dir = vec3 (h1, h2, h3);
+        float dlen = length (dir);
+        if (dlen < 1.0e-6)
+            dir = vec3 (1.0, 0.0, 0.0);
+        else
+            dir /= dlen;
+
+        vel = dir * u_minSpeed;
+    }
+    else
+        vel = vel / speed * clamp (speed, u_minSpeed, u_maxSpeed);
+
+    pos += vel * u_dt;
+
+    if (u_wrapBounds != 0)
+    {
+        // Wrap bounds
+        vec3 size = u_worldMax - u_worldMin;
+        if (pos.x < u_worldMin.x) pos.x += size.x;
+        if (pos.y < u_worldMin.y) pos.y += size.y;
+        if (pos.z < u_worldMin.z) pos.z += size.z;
+        if (pos.x > u_worldMax.x) pos.x -= size.x;
+        if (pos.y > u_worldMax.y) pos.y -= size.y;
+        if (pos.z > u_worldMax.z) pos.z -= size.z;
+    }
+    else
+    {
+        // Clamp (with soft steering above); avoids the “teleport” artifact of wrap.
+        // IMPORTANT: also prevent "sticky" walls by reflecting any outward velocity component when clamped.
+        // Otherwise, cohesion/alignment can keep pushing particles into a wall/corner and they accumulate.
+        vec3 clampedPos = clamp (pos, u_worldMin, u_worldMax);
+
+        const float eps = 1.0e-6;
+
+        if (clampedPos.x <= u_worldMin.x + eps && vel.x < 0.0) vel.x = -vel.x;
+        if (clampedPos.x >= u_worldMax.x - eps && vel.x > 0.0) vel.x = -vel.x;
+        if (clampedPos.y <= u_worldMin.y + eps && vel.y < 0.0) vel.y = -vel.y;
+        if (clampedPos.y >= u_worldMax.y - eps && vel.y > 0.0) vel.y = -vel.y;
+        if (clampedPos.z <= u_worldMin.z + eps && vel.z < 0.0) vel.z = -vel.z;
+        if (clampedPos.z >= u_worldMax.z - eps && vel.z > 0.0) vel.z = -vel.z;
+
+        pos = clampedPos;
+    }
+
+    // Color hook: by heading and speed
+    vec3 heading = normalize (vel);
+    float t = clamp ((length (vel) - u_minSpeed) / max (1.0e-3, (u_maxSpeed - u_minSpeed)), 0.0, 1.0);
+
+    float colorT = 0.0;
+    if (u_colorMode == 0)
+    {
+        colorT = 0.0;
+    }
+    else if (u_colorMode == 1)
+    {
+        // Heading -> hue (use horizontal yaw for stable, readable variation)
+        float yaw = atan (heading.z, heading.x); // [-pi, pi]
+        colorT = fract (0.5 + yaw / (2.0 * 3.14159265));
+    }
+    else if (u_colorMode == 2)
+    {
+        // Speed -> hue
+        colorT = t;
+    }
+    else
+    {
+        // Density -> hue (based on neighbour count, shaped by curve)
+        float d = clamp (float (neighbourCount) / float (kMaxNeighbours), 0.0, 1.0);
+        colorT = pow (d, max (0.1, u_densityCurve));
+    }
+
+    float hue = fract (u_hueOffset + u_hueRange * colorT);
+    vec3 col = hsv2rgb (vec3 (hue, u_saturation, u_value));
+
+    float alpha = 0.35 + 0.65 * t;
+
+    pout[int (i)].pos = vec4 (pos, 1.0);
+    pout[int (i)].vel = vec4 (vel, 0.0);
+    pout[int (i)].color = vec4 (col, alpha);
+}
+
+

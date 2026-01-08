@@ -1,0 +1,53 @@
+#version 430 core
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct Particle
+{
+    vec4 pos;
+    vec4 vel;
+    vec4 color;
+};
+
+layout (std430, binding = 0) readonly buffer ParticlesIn
+{
+    Particle p[];
+};
+
+layout (std430, binding = 2) buffer CellHeads
+{
+    coherent int head[];
+};
+
+layout (std430, binding = 3) buffer NextIndex
+{
+    int next[];
+};
+
+uniform int   u_particleCount;
+uniform ivec3 u_gridDims;
+uniform vec3  u_worldMin;
+uniform float u_cellSize;
+
+int flattenCell (ivec3 c)
+{
+    return c.x + u_gridDims.x * (c.y + u_gridDims.y * c.z);
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint (u_particleCount))
+        return;
+
+    vec3 pos = p[int (i)].pos.xyz;
+
+    ivec3 cell = ivec3 (floor ((pos - u_worldMin) / u_cellSize));
+    cell = clamp (cell, ivec3 (0), u_gridDims - ivec3 (1));
+
+    int cellIndex = flattenCell (cell);
+    int prev = atomicExchange (head[cellIndex], int (i));
+    next[int (i)] = prev;
+}
+
+
