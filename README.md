@@ -12,9 +12,8 @@ So, for a deep dive into how the code and shaders are structured (SSBOs, ping-po
 
 ## Demo video
 
-<video src="docs/JuicyFlockRecording.mp4" controls muted loop playsinline style="max-width: 100%;"></video>
-
-If the video doesn’t render inline, open: [`docs/JuicyFlockRecording.mp4`](docs/JuicyFlockRecording.mp4)
+- Watch on YouTube: [`https://www.youtube.com/watch?v=jg4g5PGKCzM`](https://www.youtube.com/watch?v=jg4g5PGKCzM)
+- Local file (stored via Git LFS): [`docs/JuicyFlockRecording.mp4`](docs/JuicyFlockRecording.mp4)
 
 ## Features
 
